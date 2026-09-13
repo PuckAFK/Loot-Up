@@ -33,7 +33,7 @@ if ENV.__PUCKAFK_LOOTUP_UNLOAD then
     pcall(ENV.__PUCKAFK_LOOTUP_UNLOAD)
 end
 
-local VERSION = "1.5.2"
+local VERSION = "1.5.3"
 local SCRIPT_KEY = "__PUCKAFK_LOOTUP_RUNTIME"
 
 local Runtime = {
@@ -107,6 +107,8 @@ local Runtime = {
     TokenPrices = nil,
     TokenPricesAt = 0,
     LastTokenPurchase = nil,
+    LastPetPurchaseAt = 0,
+    PetShopStatus = "Idle",
     TutorialSkipSentAt = 0,
     DungeonSmartDifficulty = "Normal",
     DungeonDifficultyStats = {},
@@ -425,6 +427,9 @@ local Settings = {
     SkillQualityAncientReserve = 2,
     AutoSkillEvolve = true,
     AutoPets = true,
+    AutoBuyPets = true,
+    AutoPetVariants = true,
+    PetTrainBest = true,
     AutoSkipTutorial = true,
     AutoTokenUpgrades = true,
     AutoEventChests = true,
@@ -2580,7 +2585,7 @@ end
 -- the first input pet, so always put the most progressed duplicate first. Only
 -- families currently equipped by the smart pet selector are upgraded automatically.
 Runtime.PetVariantUpgradeCandidate = function()
-    if not Settings.AutoVariantUpgrade or type(D.ItemVariants.GetUpgradeTarget) ~= "function" then return nil end
+    if not Settings.AutoPetVariants or type(D.ItemVariants.GetUpgradeTarget) ~= "function" then return nil end
     local inv = inventoryWindow()
     if not inv or type(inv.Items) ~= "table" then return nil end
     local save = tableData("Pets")
@@ -3821,14 +3826,28 @@ local function autoDungeonShopDeals()
     local reserve = math.max(0, tonumber(Settings.SoulCrystalReserve) or 0)
     if crystals <= reserve then return false end
 
-    local offers = safe(D.DungeonShopData.GetCurrentRotatingItems, D.DungeonShopData, os.time())
+    -- Prefer the live shop controller's server-synced offers when available. The
+    -- deterministic data-module fallback matches the same 12-hour rotation.
+    local shop = dungeonShopController()
+    local offers = shop and type(shop.RotatingItems) == "table" and next(shop.RotatingItems) and shop.RotatingItems
+        or safe(D.DungeonShopData.GetCurrentRotatingItems, D.DungeonShopData, os.time())
     if type(offers) ~= "table" then
         E.DungeonShop:FireServer("requestRotatingItems")
         return true
     end
 
+    -- v1.5.3: the Dungeon Shop always includes one normal in-game pet offer. Buy it
+    -- only when the pet planner says it improves the long-term lineup or contributes
+    -- toward a Golden/Shiny version of one of our best families. Robux EggOfTheAbyss
+    -- products are deliberately not touched by this path.
+    if Settings.AutoBuyPets and type(Runtime.AutoBuyBestRotatingPet) == "function" then
+        if Runtime.AutoBuyBestRotatingPet(offers, crystals, reserve) then return true end
+    end
+
+    if not Settings.AutoDungeonShopDeals then return false end
+
     -- Buy the strongest-value consumable bundle once per rotating window.
-    -- Pets and Robux crystal packs/gamepasses are deliberately excluded.
+    -- Robux crystal packs/gamepasses remain deliberately excluded.
     local best
     for _, offer in ipairs(offers) do
         if type(offer) == "table"
@@ -3966,7 +3985,7 @@ local function autoDungeonEconomy()
     local shop = dungeonShopController()
     if shop and (shop.RequestPending or shop.Animating) then return false end
     if Settings.AutoUsePotions and autoPotions() then return true end
-    if Settings.AutoDungeonShopDeals and autoDungeonShopDeals() then return true end
+    if (Settings.AutoDungeonShopDeals or Settings.AutoBuyPets) and autoDungeonShopDeals() then return true end
     if Settings.AutoDungeonGear and autoDungeonGear() then return true end
     return false
 end
@@ -3982,6 +4001,132 @@ local function petDps(info, data)
     return damage / math.max(interval or 1, 0.05)
 end
 
+Runtime.GetPetEquipLimit = function()
+    local limit = 1
+    if type(D.GamepassBenefits.GetPetEquipLimit) == "function" then
+        limit = math.max(1, math.floor(tonumber(safe(D.GamepassBenefits.GetPetEquipLimit, D.GamepassBenefits, tableData("OwnedPasses"))) or 1))
+    elseif Runtime.OwnsPermanentPass and Runtime.OwnsPermanentPass(3710353474) then
+        limit = 2
+    end
+    return limit
+end
+
+-- Score the pet at its strongest normal progression point. Age-line pets are followed
+-- through Baby -> Teen -> Adult before evaluating MAX_LEVEL. Variants are preserved,
+-- so Golden/Shiny copies naturally outrank the same normal family.
+Runtime.PetEndgameDps = function(petId, variant)
+    if type(petId) ~= "string" then return 0, petId end
+    local info = type(D.PetsData.Lookup) == "function" and safe(D.PetsData.Lookup, D.PetsData, petId)
+        or (D.PetsData.All and D.PetsData.All[petId])
+    if type(info) ~= "table" then return 0, petId end
+
+    local finalId = petId
+    local finalInfo = info
+    local seen = {}
+    for _ = 1, 6 do
+        if seen[finalId] then break end
+        seen[finalId] = true
+        local nextId = finalInfo.evolvesTo
+        if type(nextId) ~= "string" or nextId == "" then break end
+        local nextInfo = type(D.PetsData.Lookup) == "function" and safe(D.PetsData.Lookup, D.PetsData, nextId)
+            or (D.PetsData.All and D.PetsData.All[nextId])
+        if type(nextInfo) ~= "table" then break end
+        finalId = nextId
+        finalInfo = nextInfo
+    end
+
+    local maxLevel = math.max(1, math.floor(tonumber(D.PetsData.MAX_LEVEL) or 100))
+    local damage = type(D.PetsData.GetDamage) == "function"
+        and tonumber(safe(D.PetsData.GetDamage, D.PetsData, finalInfo, maxLevel, variant))
+        or tonumber(finalInfo.damage) or 0
+    local interval = type(D.PetsData.GetAttackInterval) == "function"
+        and tonumber(safe(D.PetsData.GetAttackInterval, D.PetsData, finalInfo))
+        or tonumber(finalInfo.attackSpeed) or 1
+    return damage / math.max(interval or 1, 0.05), finalId
+end
+
+Runtime.AutoBuyBestRotatingPet = function(offers, crystals, reserve)
+    if not Settings.AutoBuyPets or not E.DungeonShop or type(offers) ~= "table" then return false end
+    if now() - (tonumber(Runtime.LastPetPurchaseAt) or 0) < 3 then return false end
+
+    local save = tableData("Pets")
+    local owned = type(save.Owned) == "table" and save.Owned or {}
+    local rows = {}
+    for uid, data in pairs(owned) do
+        if type(data) == "table" and type(data.id) == "string" then
+            local potential, finalId = Runtime.PetEndgameDps(data.id, data.variant)
+            rows[#rows + 1] = {
+                uid = tostring(uid),
+                id = data.id,
+                finalId = finalId,
+                potential = potential,
+                variant = data.variant,
+            }
+        end
+    end
+    table.sort(rows, function(a, b) return a.potential > b.potential end)
+
+    local limit = Runtime.GetPetEquipLimit()
+    local missingSlot = #rows < limit
+    local weakestTop = 0
+    if not missingSlot and #rows > 0 then
+        weakestTop = tonumber(rows[math.min(limit, #rows)].potential) or 0
+    end
+
+    local topFamilies = {}
+    for i = 1, math.min(limit, #rows) do
+        local row = rows[i]
+        local normalized = type(D.ItemVariants.Normalize) == "function"
+            and safe(D.ItemVariants.Normalize, D.ItemVariants, row.variant) or row.variant
+        local rank = normalized == "Shiny" and 3 or (normalized == "Golden" and 2 or 1)
+        local old = topFamilies[row.finalId]
+        if not old or rank > old.rank then topFamilies[row.finalId] = {rank = rank, variant = normalized} end
+    end
+
+    local best
+    for _, offer in ipairs(offers) do
+        if type(offer) == "table" and type(offer.petId) == "string" and type(offer.offerId) == "string" then
+            local price = math.max(0, tonumber(offer.price) or math.huge)
+            local marker = "petDeal_" .. tostring(offer.windowIndex or "current") .. "_" .. offer.offerId
+            if price < math.huge and crystals - price >= reserve and not Runtime.Last[marker] then
+                local potential, finalId = Runtime.PetEndgameDps(offer.petId, nil)
+                local family = topFamilies[finalId]
+                local improvesLineup = missingSlot or potential > weakestTop * 1.001
+                local helpsVariant = family ~= nil and family.rank < 3
+                if improvesLineup or helpsVariant then
+                    local priority = potential / math.max(price, 1)
+                    if missingSlot then priority = priority + 1000000000 end
+                    if improvesLineup then priority = priority + potential * 1000 end
+                    if helpsVariant then priority = priority + potential * 100 end
+                    if not best or priority > best.priority then
+                        best = {
+                            offerId = offer.offerId,
+                            petId = offer.petId,
+                            finalId = finalId,
+                            price = price,
+                            potential = potential,
+                            marker = marker,
+                            priority = priority,
+                            helpsVariant = helpsVariant,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    if not best then
+        Runtime.PetShopStatus = "Waiting for a better pet offer"
+        return false
+    end
+
+    Runtime.Last[best.marker] = now()
+    Runtime.LastPetPurchaseAt = now()
+    Runtime.PetShopStatus = string.format("Buying %s for %d Soul Crystals", tostring(best.petId), math.floor(best.price))
+    E.DungeonShop:FireServer("buyRotatingItem", best.offerId)
+    return true
+end
+
 local function autoEquipPets()
     if not E.Pet then return false end
     local save = tableData("Pets")
@@ -3991,18 +4136,29 @@ local function autoEquipPets()
         if type(data) == "table" then
             local id = data.id
             local info = type(D.PetsData.Lookup) == "function" and D.PetsData:Lookup(id) or (D.PetsData.All and D.PetsData.All[id])
-            if info then ranked[#ranked + 1] = {uid = tostring(uid), dps = petDps(info, data)} end
+            if info then
+                local actual = petDps(info, data)
+                local potential = Runtime.PetEndgameDps(id, data.variant)
+                ranked[#ranked + 1] = {
+                    uid = tostring(uid),
+                    dps = actual,
+                    potential = potential,
+                }
+            end
         end
     end
-    table.sort(ranked, function(a, b) return a.dps > b.dps end)
 
-    local limit = 1
-    if type(D.GamepassBenefits.GetPetEquipLimit) == "function" then
-        limit = math.max(1, math.floor(tonumber(safe(D.GamepassBenefits.GetPetEquipLimit, D.GamepassBenefits, tableData("OwnedPasses"))) or 1))
-    elseif Runtime.OwnsPermanentPass and Runtime.OwnsPermanentPass(3710353474) then
-        limit = 2
-    end
+    -- Smart mode intentionally trains the families with the highest endgame ceiling.
+    -- This lets a newly-bought Baby Dragon/Cerberus stay equipped long enough to level
+    -- and evolve instead of being permanently benched by an older, weaker max-level pet.
+    table.sort(ranked, function(a, b)
+        if Settings.PetTrainBest and a.potential ~= b.potential then
+            return a.potential > b.potential
+        end
+        return a.dps > b.dps
+    end)
 
+    local limit = Runtime.GetPetEquipLimit()
     local desired = {}
     for i = 1, math.min(limit, #ranked) do desired[ranked[i].uid] = true end
     local current = {}
@@ -5592,14 +5748,14 @@ task.spawn(function()
             if Settings.AutoStats and throttle("stats", 2.0) then safe(autoSpendStats) end
             if Settings.AutoEquip and throttle("equip", 2.1) then safe(autoEquipBest) end
             if Settings.AutoRetrieveVariantBank and throttle("variantBankWithdraw", 7.0) then safe(Runtime.AutoWithdrawVariantBankTick) end
-            if Settings.AutoVariantUpgrade and throttle("variant", 3.0) then safe(autoVariantUpgrade) end
+            if (Settings.AutoVariantUpgrade or Settings.AutoPetVariants) and throttle("variant", 3.0) then safe(autoVariantUpgrade) end
             if Settings.AutoBankOverflow and throttle("bankOverflow", 6.0) then safe(Runtime.AutoBankOverflowTick) end
             if Settings.AutoSell and throttle("sell", 4.0) then safe(autoSellJunk) end
             if Settings.AutoForge and throttle("forge", 1.7) then safe(autoForge) end
             if Settings.AutoEnchantWeapon and throttle("enchantWeapon", 1.15) then safe(autoEnchantWeapon) end
             if Settings.AutoEnchantArmor and throttle("enchantArmor", 1.15) then safe(autoEnchantArmor) end
             if Settings.AutoRunes and throttle("runes", 1.25) then safe(autoRunes) end
-            if (Settings.AutoUsePotions or Settings.AutoDungeonShopDeals or Settings.AutoDungeonGear)
+            if (Settings.AutoUsePotions or Settings.AutoDungeonShopDeals or Settings.AutoDungeonGear or Settings.AutoBuyPets)
                 and throttle("dungeonEconomy", 2.6) then safe(autoDungeonEconomy) end
             if Settings.AutoPets and throttle("pets", 5.0) then safe(autoEquipPets) end
             if Runtime.Activity == "Dungeon" and Runtime.DungeonRunGamemode == "Survival"
@@ -5849,7 +6005,14 @@ Runtime.ProgressTab:CreateToggle({Name="Smart Skill Progression",CurrentValue=Se
     Settings.SmartSkillQuality = on
     Settings.AutoSkillEvolve = on
 end})
-Runtime.ProgressTab:CreateToggle({Name="Auto Equip Best Pets",CurrentValue=Settings.AutoPets,Flag="AutoPets",Callback=function(v) Settings.AutoPets=v==true end})
+Runtime.ProgressTab:CreateToggle({Name="Smart Pets (Buy + Equip + Upgrade)",CurrentValue=Settings.AutoPets and Settings.AutoBuyPets and Settings.AutoPetVariants,Flag="SimpleSmartPets",Callback=function(v)
+    local on = v == true
+    Settings.AutoPets = on
+    Settings.AutoBuyPets = on
+    Settings.AutoPetVariants = on
+    Settings.PetTrainBest = on
+end})
+Runtime.ProgressTab:CreateLabel("Buys useful Soul Crystal pet offers, trains the best long-term pets and equips them automatically. Robux eggs are never purchased.")
 Runtime.ProgressTab:CreateSection("Free Rewards")
 Runtime.ProgressTab:CreateToggle({Name="Claim All Free Rewards",CurrentValue=Settings.AutoDaily and Settings.AutoPlaytime and Settings.AutoSeason and Settings.AutoBasicSpin and Settings.AutoPremiumFreeSpin and Settings.AutoSeasonSpin and Settings.AutoCodes,Flag="SimpleFreeRewards",Callback=function(v)
     local on = v == true
@@ -5935,6 +6098,11 @@ Runtime.AdvancedTab:CreateToggle({Name="Auto Ascend (Resets Progress)",CurrentVa
 Runtime.AdvancedTab:CreateLabel("Warning: Ascending resets most normal progression. This stays OFF by default.")
 Runtime.AdvancedTab:CreateToggle({Name="Auto Race Reroll At Awakening 3",CurrentValue=Settings.AutoRaceReroll,Flag="AutoRaceReroll",Callback=function(v) Settings.AutoRaceReroll=v==true end})
 Runtime.AdvancedTab:CreateDropdown({Name="Race Target",Options={"Smart Farming (Angel)","Fast Combat (Elf)","Crafting / Rolling (Wizard)","Forge Power (Dwarf)","Angel","Elf","Wizard","Dwarf","Keep Current"},CurrentOption=Settings.RaceTarget,Flag="RaceTarget",Callback=function(v) Settings.RaceTarget=normalizeChoice(v) or "Smart Farming (Angel)" end})
+Runtime.AdvancedTab:CreateSection("Pet Tuning")
+Runtime.AdvancedTab:CreateToggle({Name="Buy Useful Dungeon Shop Pets",CurrentValue=Settings.AutoBuyPets,Flag="AutoBuyPets",Callback=function(v) Settings.AutoBuyPets=v==true end})
+Runtime.AdvancedTab:CreateToggle({Name="Train Highest-Potential Pets",CurrentValue=Settings.PetTrainBest,Flag="PetTrainBest",Callback=function(v) Settings.PetTrainBest=v==true end})
+Runtime.AdvancedTab:CreateToggle({Name="Upgrade Pet Variants",CurrentValue=Settings.AutoPetVariants,Flag="AutoPetVariants",Callback=function(v) Settings.AutoPetVariants=v==true end})
+Runtime.AdvancedTab:CreateLabel("Smart buying respects the Soul Crystal reserve and skips pet offers that cannot improve your lineup. Paid Robux eggs are ignored.")
 Runtime.AdvancedTab:CreateSection("Dungeon Tuning")
 Runtime.AdvancedTab:CreateDropdown({Name="Potion Strategy",Options={"Smart","Always"},CurrentOption=Settings.PotionStrategy,Flag="PotionStrategy",Callback=function(v) Settings.PotionStrategy=normalizeChoice(v) or "Smart" end})
 Runtime.AdvancedTab:CreateSlider({Name="Soul Crystal Reserve",Range={0,100000},Increment=2500,CurrentValue=Settings.SoulCrystalReserve,Suffix="",Flag="SoulCrystalReserve",Callback=function(v) Settings.SoulCrystalReserve=math.floor(tonumber(v) or 10000) end})
@@ -5947,7 +6115,7 @@ Runtime.SettingsTab:CreateToggle({Name="Low-Lag Mode While Farming",CurrentValue
     Runtime.ApplyAFKPerformanceMode(Settings.Master and Settings.AFKPerformanceMode)
 end})
 Runtime.SettingsTab:CreateSection("Script")
-Runtime.SettingsTab:CreateParagraph({Title="Build",Content="Loot Up v"..VERSION.." · Portal Travel · Simplified UI",Height=48})
+Runtime.SettingsTab:CreateParagraph({Title="Build",Content="Loot Up v"..VERSION.." · Smart Pets · Portal Travel",Height=48})
 Runtime.SettingsTab:CreateButton({Name="Unload Script",Callback=function() if ENV.__PUCKAFK_LOOTUP_UNLOAD then ENV.__PUCKAFK_LOOTUP_UNLOAD() end end})
 
 -- PuckUI's Settings tab injects shared interface controls and its built-in Configs tab.
@@ -6013,7 +6181,7 @@ ENV.__PUCKAFK_LOOTUP_UNLOAD = unload
 
 PuckUI:Notify({
     Title = "Loot Up",
-    Content = "Smart autofarm v"..VERSION.." loaded with the simplified UI.",
+    Content = "Smart autofarm v"..VERSION.." loaded with smart pet progression.",
     Duration = 3,
 })
 
