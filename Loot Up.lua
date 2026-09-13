@@ -33,7 +33,7 @@ if ENV.__PUCKAFK_LOOTUP_UNLOAD then
     pcall(ENV.__PUCKAFK_LOOTUP_UNLOAD)
 end
 
-local VERSION = "1.5.1"
+local VERSION = "1.5.2"
 local SCRIPT_KEY = "__PUCKAFK_LOOTUP_RUNTIME"
 
 local Runtime = {
@@ -136,8 +136,10 @@ local Runtime = {
     -- pauses combat so the per-frame enemy position lock cannot snap us back.
     TravelUntil = 0,
     TravelWorld = nil,
+    TravelFinalWorld = nil,
     TravelZone = nil,
     TravelReason = nil,
+    TravelPortalHitbox = nil,
     LastTravelAt = 0,
     LastTravelWorld = nil,
     LastTravelZone = nil,
@@ -4345,37 +4347,141 @@ end
 -- close to Luau's 200-local chunk limit; table fields provide headroom without
 -- changing behavior or creating additional main-function registers.
 Runtime.TravelActive = function()
+    local wanted = Runtime.TravelWorld
+    if type(wanted) == "string" and getData("CurrentWorld") == wanted then
+        Runtime.TravelUntil = 0
+        Runtime.TravelWorld = nil
+        Runtime.TravelPortalHitbox = nil
+        return false
+    end
     return now() < (tonumber(Runtime.TravelUntil) or 0)
 end
 
+-- Loot Up's normal cross-world path is physical portal contact. The map fast-teleport
+-- path is a separate gamepass feature, so firing TeleportZone directly without owning
+-- that pass can leave CurrentWorld unchanged forever. Reuse the game's own portal
+-- lookup first, then mirror its fallback search.
+Runtime.GetPortalHitbox = function(worldId)
+    if type(worldId) ~= "string" then return nil end
+
+    local worldController = Controllers.World
+    if worldController and type(worldController.GetPortalHitbox) == "function" then
+        local hitbox = safe(worldController.GetPortalHitbox, worldController, worldId)
+        if typeof(hitbox) == "Instance" and hitbox:IsA("BasePart") and hitbox.Parent then
+            return hitbox
+        end
+    end
+
+    for _, portal in ipairs(CollectionService:GetTagged("Portal")) do
+        if portal:GetAttribute("World") == worldId then
+            local hitbox = portal:FindFirstChild("Hitbox", true)
+            if hitbox and hitbox:IsA("BasePart") then
+                return hitbox
+            end
+        end
+    end
+
+    local coreObjects = workspace:FindFirstChild("CoreObjects")
+    local portals = coreObjects and coreObjects:FindFirstChild("Portals")
+    local portal = portals and portals:FindFirstChild(worldId)
+    local hitbox = portal and portal:FindFirstChild("Hitbox", true)
+    return hitbox and hitbox:IsA("BasePart") and hitbox or nil
+end
+
+Runtime.ResolvePortalHop = function(targetWorld)
+    local currentWorld = tostring(getData("CurrentWorld") or "")
+    local currentNumber = tonumber(currentWorld:match("^World(%d+)$"))
+    local targetNumber = type(targetWorld) == "string" and tonumber(targetWorld:match("^World(%d+)$")) or nil
+    if not currentNumber or not targetNumber then return targetWorld end
+    if targetNumber > currentNumber + 1 then
+        return "World" .. tostring(currentNumber + 1)
+    end
+    if targetNumber < currentNumber - 1 then
+        return "World" .. tostring(currentNumber - 1)
+    end
+    return targetWorld
+end
+
 Runtime.RequestZoneTeleport = function(worldId, zone, reason)
-    if not E.TeleportZone or type(worldId) ~= "string" then return false end
+    if type(worldId) ~= "string" then return false end
 
     zone = math.max(1, math.floor(tonumber(zone) or 1))
     local t = now()
     local currentWorld = getData("CurrentWorld")
 
-    -- Same-world zone requests were the main source of unexplained bouncing. The
-    -- farmer already moves directly to its selected enemy/NPC, so re-firing the
-    -- game's zone teleport while fighting is unnecessary and disruptive.
+    -- Same-world zone requests remain suppressed. Direct farm movement already reaches
+    -- the requested enemy/NPC without bouncing through a zone spawn.
     if currentWorld == worldId then
         Runtime.LastPlannedWorld = worldId
         Runtime.LastPlannedZone = zone
         return false
     end
 
-    -- Do not stack duplicate travel requests while the server/transition controller
-    -- is still processing the first one.
     if Runtime.TravelActive() then return false end
-    if Runtime.LastTravelWorld == worldId
+
+    local hopWorld = Runtime.ResolvePortalHop(worldId)
+    if type(hopWorld) ~= "string" then return false end
+
+    -- Forward progression is intentionally walked one portal at a time. This mirrors
+    -- the map layout (World1 -> World2 -> World3...) and avoids touching a portal that
+    -- physically belongs to a later world while CurrentWorld still points elsewhere.
+    if hopWorld ~= "World1" and not worldUnlocked(hopWorld) then
+        local hopInfo
+        for _, info in ipairs(orderedWorlds) do
+            if info.id == hopWorld then hopInfo = info break end
+        end
+        if hopInfo and requirementsMet(hopInfo) and E.UnlockWorld then
+            E.UnlockWorld:FireServer(hopWorld)
+            Runtime.TravelUntil = t + 0.85
+            Runtime.TravelWorld = nil
+            Runtime.TravelFinalWorld = worldId
+            Runtime.TravelReason = "Unlocking " .. hopWorld
+            Runtime.LastPlannedWorld = worldId
+            Runtime.LastPlannedZone = zone
+            return true
+        end
+        return false
+    end
+
+    if Runtime.LastTravelWorld == hopWorld
         and Runtime.LastTravelZone == zone
         and t - (tonumber(Runtime.LastTravelAt) or 0) < 2.5 then
         return false
     end
 
-    -- Travel gets exclusive movement ownership. Clear stale combat positioning
-    -- before firing the remote and keep the combat loop paused long enough for the
-    -- replicated CurrentWorld/character position to settle.
+    local hitbox = Runtime.GetPortalHitbox(hopWorld)
+    if not hitbox then
+        -- Only fall back to the game's map teleport remote when the account actually
+        -- owns that feature. Without it, the correct route is the physical portal.
+        local gamepasses = tableData("Gamepasses")
+        if E.TeleportZone and gamepasses.Teleport == true then
+            releaseDownFacingLock()
+            Runtime.Target = nil
+            Runtime.PositionTarget = nil
+            Runtime.CurrentHoverHeight = nil
+            Runtime.TargetBodyHeight = nil
+            Runtime.TargetBodyWidth = nil
+            setAutoSwing(false)
+            Runtime.TravelUntil = t + 2.0
+            Runtime.TravelWorld = hopWorld
+            Runtime.TravelFinalWorld = worldId
+            Runtime.TravelZone = zone
+            Runtime.TravelReason = tostring(reason or "World travel") .. " (fast teleport)"
+            Runtime.LastTravelAt = t
+            Runtime.LastTravelWorld = hopWorld
+            Runtime.LastTravelZone = zone
+            Runtime.LastPlannedWorld = worldId
+            Runtime.LastPlannedZone = zone
+            E.TeleportZone:FireServer(hopWorld, hopWorld == worldId and zone or 1)
+            return true
+        end
+        Runtime.TravelReason = "Finding portal to " .. hopWorld
+        Runtime.TravelUntil = t + 0.6
+        Runtime.TravelWorld = nil
+        Runtime.TravelFinalWorld = worldId
+        return false
+    end
+
     releaseDownFacingLock()
     Runtime.Target = nil
     Runtime.PositionTarget = nil
@@ -4384,17 +4490,59 @@ Runtime.RequestZoneTeleport = function(worldId, zone, reason)
     Runtime.TargetBodyWidth = nil
     setAutoSwing(false)
 
-    Runtime.TravelUntil = t + 1.6
-    Runtime.TravelWorld = worldId
+    Runtime.TravelUntil = t + 4.0
+    Runtime.TravelWorld = hopWorld
+    Runtime.TravelFinalWorld = worldId
     Runtime.TravelZone = zone
-    Runtime.TravelReason = tostring(reason or "World travel")
+    Runtime.TravelPortalHitbox = hitbox
+    Runtime.TravelReason = (hopWorld == worldId)
+        and ("Portal -> " .. hopWorld)
+        or ("Portal -> " .. hopWorld .. " -> " .. worldId)
     Runtime.LastTravelAt = t
-    Runtime.LastTravelWorld = worldId
+    Runtime.LastTravelWorld = hopWorld
     Runtime.LastTravelZone = zone
     Runtime.LastPlannedWorld = worldId
     Runtime.LastPlannedZone = zone
 
-    E.TeleportZone:FireServer(worldId, zone)
+    local _, _, root = getCharacter()
+    if not root then
+        Runtime.TravelUntil = 0
+        Runtime.TravelWorld = nil
+        Runtime.TravelPortalHitbox = nil
+        return false
+    end
+
+    -- Put the character inside the same Hitbox used by Loot Up's World controller.
+    -- firetouchinterest is used when available, while the physical overlap remains a
+    -- fallback so this still follows the real portal path rather than a paid shortcut.
+    root.CFrame = hitbox.CFrame
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    if type(firetouchinterest) == "function" then
+        pcall(firetouchinterest, root, hitbox, 0)
+        task.delay(0.08, function()
+            if root and root.Parent and hitbox and hitbox.Parent then
+                pcall(firetouchinterest, root, hitbox, 1)
+            end
+        end)
+    end
+
+    -- Some servers only register the overlap on the following physics step. Re-touch
+    -- once without spamming, provided the portal has not already changed CurrentWorld.
+    task.delay(0.22, function()
+        if not Runtime.Alive or Runtime.TravelWorld ~= hopWorld or getData("CurrentWorld") == hopWorld then return end
+        local _, _, currentRoot = getCharacter()
+        if currentRoot and hitbox and hitbox.Parent then
+            currentRoot.CFrame = hitbox.CFrame
+            currentRoot.AssemblyLinearVelocity = Vector3.zero
+            currentRoot.AssemblyAngularVelocity = Vector3.zero
+            if type(firetouchinterest) == "function" then
+                pcall(firetouchinterest, currentRoot, hitbox, 0)
+                pcall(firetouchinterest, currentRoot, hitbox, 1)
+            end
+        end
+    end)
+
     return true
 end
 
@@ -5799,7 +5947,7 @@ Runtime.SettingsTab:CreateToggle({Name="Low-Lag Mode While Farming",CurrentValue
     Runtime.ApplyAFKPerformanceMode(Settings.Master and Settings.AFKPerformanceMode)
 end})
 Runtime.SettingsTab:CreateSection("Script")
-Runtime.SettingsTab:CreateParagraph({Title="Build",Content="Loot Up v"..VERSION.." · Simplified UI · Current PuckUI",Height=48})
+Runtime.SettingsTab:CreateParagraph({Title="Build",Content="Loot Up v"..VERSION.." · Portal Travel · Simplified UI",Height=48})
 Runtime.SettingsTab:CreateButton({Name="Unload Script",Callback=function() if ENV.__PUCKAFK_LOOTUP_UNLOAD then ENV.__PUCKAFK_LOOTUP_UNLOAD() end end})
 
 -- PuckUI's Settings tab injects shared interface controls and its built-in Configs tab.
