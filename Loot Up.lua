@@ -33,7 +33,7 @@ if ENV.__PUCKAFK_LOOTUP_UNLOAD then
     pcall(ENV.__PUCKAFK_LOOTUP_UNLOAD)
 end
 
-local VERSION = "1.5.0"
+local VERSION = "1.5.1"
 local SCRIPT_KEY = "__PUCKAFK_LOOTUP_RUNTIME"
 
 local Runtime = {
@@ -55,6 +55,7 @@ local Runtime = {
     PotentialOffer = nil,
     PotentialLastOpen = 0,
     PotentialLastChoice = 0,
+    PotentialLastUpgrade = 0,
     NpcStatesLoadedAt = -math.huge,
     NpcStatesPrimed = false,
     NpcStateRefreshInFlight = false,
@@ -69,6 +70,10 @@ local Runtime = {
     BestFarmEnemyLevel = nil,
     PendingNpcQuest = nil,
     PendingNpcQuestUntil = 0,
+    QuestReplaceFrom = nil,
+    QuestReplaceTo = nil,
+    QuestReplaceStartedAt = 0,
+    QuestReplaceCooldownUntil = 0,
     QuestAcquiring = false,
     QuestAcquireUntil = 0,
     LastQuestAcceptId = nil,
@@ -1425,7 +1430,16 @@ if NPCController and NPCController.Changed then
         if Runtime.PendingNpcQuest and NPCController.ActiveQuestId == Runtime.PendingNpcQuest then
             Runtime.PendingNpcQuest = nil
             Runtime.PendingNpcQuestUntil = 0
+            Runtime.QuestReplaceFrom = nil
+            Runtime.QuestReplaceTo = nil
+            Runtime.QuestReplaceStartedAt = 0
+            Runtime.QuestReplaceCooldownUntil = 0
             Runtime.QuestAcquiring = false
+        elseif Runtime.QuestReplaceFrom and NPCController.ActiveQuestId ~= Runtime.QuestReplaceFrom then
+            -- The old quest has actually stopped being active. Release combat/travel
+            -- ownership so the next NPC tick can travel to and accept the replacement.
+            Runtime.QuestAcquiring = false
+            Runtime.QuestAcquireUntil = 0
         end
         if Settings.AutoNPCQuests then
             task.defer(function()
@@ -2930,6 +2944,14 @@ end
 
 local function autoBuyStandardTree()
     if not E.SkillTree or type(D.SkillTree.Nodes) ~= "table" then return end
+
+    -- Loot Up's current SkillTree remote is owned by PotentialTree v2. The old
+    -- upgrade-tree UI used the action "Purchase", but PotentialTree only accepts
+    -- Sync/OpenNode/Choose/Upgrade/Reroll. Sending legacy Purchase calls here caused
+    -- eight "[PotentialTree] Purchase rejected: invalid_action" warnings every tick.
+    -- Keep this legacy path dormant whenever the PotentialTree data module is active.
+    if type(D.PotentialTree) == "table" and tonumber(D.PotentialTree.Version) then return end
+
     local sent = 0
     for _, node in ipairs(D.SkillTree.Nodes) do
         local id = node.id or node.Id
@@ -3083,7 +3105,10 @@ local function autoPotential()
     end
     if Settings.AutoPotentialUpgrade then
         local upgrade = potentialUpgradeCandidate(state)
-        if upgrade then E.SkillTree:FireServer("Upgrade", upgrade) end
+        if upgrade and now() - (Runtime.PotentialLastUpgrade or 0) > 0.75 then
+            E.SkillTree:FireServer("Upgrade", upgrade)
+            Runtime.PotentialLastUpgrade = now()
+        end
     end
 end
 
@@ -4421,7 +4446,26 @@ local function autoNPCQuest()
     if Runtime.PendingNpcQuest and now() >= (Runtime.PendingNpcQuestUntil or 0) then
         Runtime.PendingNpcQuest = nil
         Runtime.PendingNpcQuestUntil = 0
+        Runtime.QuestReplaceFrom = nil
+        Runtime.QuestReplaceTo = nil
+        Runtime.QuestReplaceStartedAt = 0
         Runtime.QuestAcquiring = false
+    end
+
+    -- If a replacement cancellation was rejected or never replicated, abandon the
+    -- switch instead of travelling/retrying forever. Farm the current quest for a
+    -- while before reconsidering another replacement.
+    if Runtime.QuestReplaceFrom
+        and NPCController.ActiveQuestId == Runtime.QuestReplaceFrom
+        and now() - (Runtime.QuestReplaceStartedAt or 0) >= 2.0 then
+        Runtime.PendingNpcQuest = nil
+        Runtime.PendingNpcQuestUntil = 0
+        Runtime.QuestReplaceFrom = nil
+        Runtime.QuestReplaceTo = nil
+        Runtime.QuestReplaceStartedAt = 0
+        Runtime.QuestReplaceCooldownUntil = now() + 30
+        Runtime.QuestAcquiring = false
+        Runtime.QuestAcquireUntil = 0
     end
 
     -- Keep cooldown/active data fresh without blocking the farm loop. The initial
@@ -4436,42 +4480,44 @@ local function autoNPCQuest()
             Runtime.QuestAcquiring = false
         end
         -- If a substantially better quest unlocks while the current one is still
-        -- near the beginning, walk to the new giver and accept it directly. The
-        -- server atomically cancels the previous quest and accepts the new one; the
-        -- supplied runtime log confirms this exact NPCQuest.Accept behavior.
+        -- near the beginning, switch safely. Loot Up only allows one active NPC quest:
+        -- a different Accept is reported as activeElsewhere, so cancel the old quest
+        -- first and only accept the replacement after that state has cleared.
         local replacement = shouldReplaceActiveNpcQuest(id, def, state)
-        if replacement then
+        if replacement and now() >= (Runtime.QuestReplaceCooldownUntil or 0) then
             Runtime.BestNpcQuest = replacement.id
             Runtime.BestNpcQuestGiver = replacement.giverName
             Runtime.BestNpcQuestScore = replacement.score
             Runtime.PendingNpcQuest = replacement.id
             Runtime.PendingNpcQuestUntil = now() + 12
+            Runtime.QuestReplaceFrom = id
+            Runtime.QuestReplaceTo = replacement.id
+            Runtime.QuestReplaceStartedAt = now()
             Runtime.QuestAcquiring = true
-            Runtime.QuestAcquireUntil = Runtime.PendingNpcQuestUntil
+            Runtime.QuestAcquireUntil = now() + 2.0
             Runtime.Target = nil
+            Runtime.PositionTarget = nil
+            Runtime.CurrentHoverHeight = nil
+            Runtime.TargetName = string.format(
+                "Switching quest: %s -> %s",
+                tostring(id),
+                tostring(replacement.id)
+            )
+            releaseDownFacingLock()
+            setAutoSwing(false)
 
-            local currentWorld = getData("CurrentWorld")
-            local replacementZone = npcQuestZone(replacement.world, replacement.def, replacement.state)
-            if replacement.world and currentWorld ~= replacement.world and E.TeleportZone then
-                Runtime.RequestZoneTeleport(replacement.world, replacementZone, "NPC quest replacement")
-                return
+            -- The real NPC quest controller refuses a different quest while one is
+            -- active (activeElsewhere). Cancel first, then accept the replacement on a
+            -- later tick after the replicated state confirms the old quest is inactive.
+            sendNpcQuestAction(id, "cancel")
+            if type(NPCController.ApplyOptimisticCancel) == "function" then
+                safe(NPCController.ApplyOptimisticCancel, NPCController, id)
             end
-
-            if moveToQuestGiver(replacement) or not Settings.QuestTravelToGiver then
-                if now() - Runtime.LastQuestAcceptAt > 1.0 or Runtime.LastQuestAcceptId ~= replacement.id then
-                    Runtime.TargetName = string.format(
-                        "Switching quest: %s (+%.0f%%)",
-                        tostring(replacement.id),
-                        tonumber(replacement.improvement) or 0
-                    )
-                    sendNpcQuestAction(replacement.id)
-                    task.delay(0.25, function()
-                        if Runtime.Alive and type(NPCController.RequestState) == "function" then
-                            safe(NPCController.RequestState, NPCController, replacement.id)
-                        end
-                    end)
+            task.delay(0.35, function()
+                if Runtime.Alive and type(NPCController.RequestState) == "function" then
+                    safe(NPCController.RequestState, NPCController, id)
                 end
-            end
+            end)
             return
         end
 
@@ -4521,6 +4567,9 @@ local function autoNPCQuest()
     -- normal quest dialogue. This also satisfies any server-side proximity check.
     if moveToQuestGiver(plan) or not Settings.QuestTravelToGiver then
         if now() - Runtime.LastQuestAcceptAt > 1.0 or Runtime.LastQuestAcceptId ~= plan.id then
+            Runtime.TargetName = Runtime.QuestReplaceTo == plan.id
+                and ("Accepting replacement: " .. tostring(plan.id))
+                or ("Accepting quest: " .. tostring(plan.id))
             sendNpcQuestAction(plan.id)
             Runtime.PendingNpcQuest = plan.id
             Runtime.PendingNpcQuestUntil = now() + 10
@@ -5475,7 +5524,10 @@ local function describeQuestPlan()
     local pendingId = Runtime.PendingNpcQuest
     if type(pendingId) == "string" then
         local giver = NPCQuestGiverNameById[pendingId] or pendingId
-        return string.format("Switching -> %s @ %s", pendingId, giver)
+        if Runtime.QuestReplaceFrom then
+            return string.format("Switching safely -> %s @ %s", pendingId, giver)
+        end
+        return string.format("Accepting -> %s @ %s", pendingId, giver)
     end
 
     local id, def, state = activeNpcQuest()
@@ -5508,7 +5560,7 @@ local function describeQuestPlan()
 end
 
 -- UI ----------------------------------------------------------------------------
--- v1.5.0: simplified user-facing layout. The automation remains comprehensive,
+-- v1.5.1: simplified user-facing layout. The automation remains comprehensive,
 -- but normal users only see the choices that materially change how the farm runs.
 -- Rare tuning is isolated in Advanced so the default experience stays clean.
 Runtime.Window = PuckUI:CreateWindow({
